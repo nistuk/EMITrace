@@ -19,7 +19,7 @@ Thumbs.db
 _verify.py
 _compare.py
 *.log
-emi_analysis.executed.ipynb
+emi_analysis.executed*.ipynb
 
 # Generated comparison artefacts (the canonical ones in reports/ are kept)
 reports/compare/
