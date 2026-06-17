@@ -25,6 +25,8 @@ import plotly.io as pio
 import streamlit as st
 from plotly.subplots import make_subplots
 
+import emc_analysis as emc
+
 DATA_ROOT = Path('data')
 
 # CISPR 11 Group 1 radiated QP limits referenced to a 10 m measurement distance.
@@ -262,9 +264,7 @@ def build_html_report(overlay_fig: go.Figure, delta_fig: go.Figure,
 # Streamlit UI
 # --------------------------------------------------------------------------- #
 
-def main() -> None:
-    st.set_page_config(page_title='EMI Trace Comparison Dashboard',
-                       layout='wide')
+def page_comparison() -> None:
     st.title('EMI trace comparison dashboard')
     st.caption('Pick one reference trace and any number of comparisons; '
                'the dashboard renders an overlay, Δ-vs-reference subplots, '
@@ -389,6 +389,171 @@ def main() -> None:
             'Download Δ data (CSV)', data=csv_bytes,
             file_name=f'emi_custom_delta_{stamp}.csv',
             mime='text/csv', use_container_width=True)
+
+
+# --------------------------------------------------------------------------- #
+# EMC compliance analysis page
+# --------------------------------------------------------------------------- #
+
+def _select_configs() -> tuple[dict[str, object], dict]:
+    """Sidebar/source controls returning {label: source} + load knobs."""
+    with st.sidebar:
+        st.header('Settings')
+        cispr_class = st.radio('CISPR 11 class', ['A', 'B'], horizontal=True,
+                               key='emc_class')
+        meas_distance = st.number_input(
+            'Measurement distance (m)', min_value=0.5, max_value=20.0,
+            value=3.0, step=0.5, key='emc_meas')
+        limit_distance = st.number_input(
+            'Limit reference distance (m)', min_value=1.0, max_value=30.0,
+            value=10.0, step=1.0, key='emc_limit')
+        prominence = st.slider('Peak prominence (dB)', 3.0, 20.0, 6.0, 0.5,
+                               key='emc_prom')
+        min_sep = st.slider('Min peak separation (MHz)', 0.5, 10.0, 2.0, 0.5,
+                            key='emc_sep')
+        source_mode = st.radio('Trace source',
+                               ['Workspace `data/`', 'Upload'], key='emc_src')
+
+    dist_corr_db = 20.0 * np.log10(meas_distance / limit_distance)
+    st.sidebar.caption(f'Distance correction applied: {dist_corr_db:+.2f} dB')
+
+    sources: dict[str, object] = {}
+    if source_mode == 'Workspace `data/`':
+        files = discover_trace_files(DATA_ROOT)
+        if not files:
+            st.error(f'No `.txt` trace files found under {DATA_ROOT}/.')
+            return {}, {}
+        labels = [str(p.relative_to(DATA_ROOT)) for p in files]
+        path_for_label = dict(zip(labels, files))
+        picked = st.multiselect(
+            'Configurations to analyse (pick 2 or more)', labels,
+            key='emc_pick')
+        sources = {lab: path_for_label[lab] for lab in picked}
+    else:
+        uploads = st.file_uploader(
+            'Configuration traces (.txt, multiple)', type=['txt'],
+            accept_multiple_files=True, key='emc_upload')
+        sources = {f.name: f for f in (uploads or [])}
+
+    return sources, dict(cispr_class=cispr_class, meas_distance=meas_distance,
+                         limit_distance=limit_distance, dist_corr_db=dist_corr_db,
+                         prominence=prominence, min_sep=min_sep)
+
+
+def page_emc_analysis() -> None:
+    st.title('EMC compliance analysis')
+    st.caption('Full IEC 60601-1-2 / CISPR 11 style workflow: validation, '
+               'per-configuration statistics, worst-case envelope, margin '
+               'analysis, spectral interpretation and a structured, '
+               'downloadable HTML report.')
+
+    sources, knobs = _select_configs()
+    if len(sources) < 2:
+        st.info('Pick at least two configurations to compare.')
+        return
+
+    with st.expander('Report metadata (optional)'):
+        m1, m2 = st.columns(2)
+        with m1:
+            title = st.text_input('Report title',
+                                   value='EMC radiated-emission analysis')
+            revision = st.text_input('Revision', value='A')
+            prepared_by = st.text_input('Prepared by')
+        with m2:
+            reviewed_by = st.text_input('Reviewed by')
+            approved_by = st.text_input('Approved by')
+
+    try:
+        traces = {name: load_trace(src, knobs['dist_corr_db'])
+                  for name, src in sources.items()}
+    except Exception as exc:  # noqa: BLE001
+        st.error(f'Failed to read a trace: {exc}')
+        return
+
+    inp = emc.ReportInputs(
+        title=title, traces=traces, cls=knobs['cispr_class'],
+        meas_distance=knobs['meas_distance'],
+        limit_distance=knobs['limit_distance'],
+        prominence_db=knobs['prominence'], min_sep_mhz=knobs['min_sep'],
+        prepared_by=prepared_by, reviewed_by=reviewed_by,
+        approved_by=approved_by, revision=revision)
+
+    try:
+        bundle = emc.run_analysis(inp)
+    except Exception as exc:  # noqa: BLE001
+        st.error(f'Analysis failed: {exc}')
+        return
+
+    m = bundle.margin
+    if m.worst_margin_db < 0:
+        st.error(f'Worst-case envelope EXCEEDS the limit by '
+                 f'{-m.worst_margin_db:.1f} dB at '
+                 f'{m.worst_margin_freq_mhz:.1f} MHz '
+                 f'(from “{m.worst_contributor}”).')
+    else:
+        st.success(f'Worst-case envelope within limit — minimum margin '
+                   f'{m.worst_margin_db:+.1f} dB at '
+                   f'{m.worst_margin_freq_mhz:.1f} MHz.')
+
+    tabs = st.tabs(['Summary', 'Validation', 'Plots', 'Peaks',
+                    'Worst case'])
+    with tabs[0]:
+        st.dataframe(bundle.summary_table, use_container_width=True)
+    with tabs[1]:
+        vrows = [{
+            'Configuration': v.name, 'Points': v.n_points,
+            'Range (MHz)': f'{v.f_min:.0f}–{v.f_max:.0f}',
+            'Step (MHz)': round(v.median_step_mhz, 3),
+            'Status': 'OK' if v.usable and not v.flags else
+                      ('FLAGGED' if v.usable else 'EXCLUDED'),
+            'Notes': '; '.join(v.issues + v.flags) or '—',
+        } for v in bundle.validations.values()]
+        st.dataframe(pd.DataFrame(vrows), use_container_width=True)
+    with tabs[2]:
+        st.plotly_chart(bundle.figures['overlay'], use_container_width=True)
+        st.plotly_chart(bundle.figures['envelope'], use_container_width=True)
+        st.plotly_chart(bundle.figures['margin'], use_container_width=True)
+        st.plotly_chart(bundle.figures['zoom'], use_container_width=True)
+        st.plotly_chart(bundle.figures['bars'], use_container_width=True)
+    with tabs[3]:
+        for name, s in bundle.stats.items():
+            st.markdown(f'**{name}** — {len(s.peaks)} peaks')
+            if len(s.peaks):
+                st.dataframe(s.peaks.head(12), use_container_width=True)
+    with tabs[4]:
+        st.markdown(f'### {bundle.worst.name}')
+        st.write(bundle.worst.rationale)
+        st.write(emc.spectral_narrative(bundle.stats, bundle.worst))
+
+    report_html = emc.build_report_html(inp, bundle)
+    env_csv = bundle.envelope.to_csv(index=False).encode('utf-8')
+    stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    d1, d2 = st.columns(2)
+    with d1:
+        st.download_button(
+            'Download full HTML report', data=report_html,
+            file_name=f'emc_report_{stamp}.html', mime='text/html',
+            use_container_width=True)
+    with d2:
+        st.download_button(
+            'Download worst-case envelope (CSV)', data=env_csv,
+            file_name=f'emc_envelope_{stamp}.csv', mime='text/csv',
+            use_container_width=True)
+
+
+# --------------------------------------------------------------------------- #
+# Entry point
+# --------------------------------------------------------------------------- #
+
+def main() -> None:
+    st.set_page_config(page_title='EMI / EMC Dashboard', layout='wide')
+    page = st.sidebar.radio(
+        'Tool', ['Trace comparison', 'EMC compliance analysis'])
+    st.sidebar.markdown('---')
+    if page == 'Trace comparison':
+        page_comparison()
+    else:
+        page_emc_analysis()
 
 
 if __name__ == '__main__':

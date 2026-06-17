@@ -23,3 +23,7 @@ emi_analysis.executed*.ipynb
 
 # Generated comparison artefacts (the canonical ones in reports/ are kept)
 reports/compare/
+
+# Raw measurement data and generated reports (kept out of version control)
+data/
+reports/
