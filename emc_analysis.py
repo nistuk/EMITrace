@@ -76,6 +76,103 @@ def limit_line(cls: str) -> tuple[np.ndarray, np.ndarray]:
 
 
 # --------------------------------------------------------------------------- #
+# R&S header parsing
+# --------------------------------------------------------------------------- #
+
+def parse_rs_header(source) -> dict:
+    """Extract the ``% [Header]`` metadata block from an R&S EMI-Scan file.
+
+    Accepts a filesystem path or a file-like object (e.g. a Streamlit upload).
+    Returns a normalised dict with the engineering-relevant fields plus a
+    ``raw`` sub-dict of every ``% Key=Value`` line. Missing fields are simply
+    absent. The file/stream position is restored for file-like sources so the
+    caller can still read the data with ``pandas`` afterwards.
+    """
+    header_lines: list[str] = []
+    if hasattr(source, 'read'):
+        try:
+            source.seek(0)
+        except Exception:  # noqa: BLE001
+            pass
+        raw = source.read()
+        if isinstance(raw, bytes):
+            raw = raw.decode('utf-8', errors='replace')
+        try:
+            source.seek(0)
+        except Exception:  # noqa: BLE001
+            pass
+        for line in raw.splitlines():
+            if line.startswith('%'):
+                header_lines.append(line)
+            elif line.strip():
+                break  # first data row reached
+    else:
+        with open(source, 'r', encoding='utf-8', errors='replace') as fh:
+            for line in fh:
+                if line.startswith('%'):
+                    header_lines.append(line.rstrip('\n'))
+                elif line.strip():
+                    break
+
+    raw_kv: dict[str, str] = {}
+    for line in header_lines:
+        body = line.lstrip('%').strip()
+        if '=' in body:
+            key, _, val = body.partition('=')
+            raw_kv[key.strip()] = val.strip()
+
+    out: dict = {'raw': raw_kv}
+    if 'Detector Mode' in raw_kv:
+        out['detector'] = raw_kv['Detector Mode']
+    if 'IF Filter' in raw_kv:
+        out['if_filter'] = raw_kv['IF Filter']
+    if 'Dwell Time' in raw_kv:
+        out['dwell'] = raw_kv['Dwell Time']
+    if 'Attenuation Level' in raw_kv:
+        out['attenuation'] = raw_kv['Attenuation Level']
+    if 'Start Time' in raw_kv:
+        out['start_time'] = raw_kv['Start Time']
+    if 'Stop Time' in raw_kv:
+        out['stop_time'] = raw_kv['Stop Time']
+    if 'OverRange Flag' in raw_kv:
+        out['overrange'] = raw_kv['OverRange Flag'].strip() not in ('0', '', 'No')
+
+    # Antenna: prefer a transducer entry that names an antenna model. Strong
+    # model tokens (trilog/vulb/horn/…) win; a bare "antenna" substring is
+    # weak because cable transducers are often named "…AntennaCable…", so
+    # entries containing "cable" are demoted.
+    transducers = {k: v for k, v in raw_kv.items() if k.startswith('Transducer')}
+    strong = ('trilog', 'vulb', 'biconical', 'bilog', 'log-per', 'logper',
+              'horn', 'schwarzbeck', 'dipole')
+
+    def _antenna_score(val: str) -> int:
+        low = val.lower()
+        score = 0
+        if any(tok in low for tok in strong):
+            score += 2
+        if 'antenna' in low:
+            score += 1
+        if 'cable' in low:
+            score -= 2
+        return score
+
+    antenna = None
+    if transducers:
+        best_key = max(transducers, key=lambda k: _antenna_score(transducers[k]))
+        if _antenna_score(transducers[best_key]) > 0:
+            antenna = transducers[best_key]
+        else:
+            # nothing looked like an antenna — fall back to the highest index
+            def _tnum(k: str) -> int:
+                digits = ''.join(ch for ch in k if ch.isdigit())
+                return int(digits) if digits else 0
+            antenna = transducers[max(transducers, key=_tnum)]
+    if antenna:
+        out['antenna'] = antenna
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # 1. Data validation
 # --------------------------------------------------------------------------- #
 
@@ -89,6 +186,7 @@ class ValidationResult:
     grid_regular: bool
     issues: list[str] = field(default_factory=list)
     flags: list[str] = field(default_factory=list)
+    header: dict = field(default_factory=dict)
 
     @property
     def usable(self) -> bool:
@@ -97,24 +195,35 @@ class ValidationResult:
 
 
 def validate_trace(name: str, df: pd.DataFrame,
+                   header: Optional[dict] = None,
                    clip_run_len: int = 6) -> ValidationResult:
     """Validate one trace and surface data-quality problems.
 
     Detects empty/short traces, NaNs, non-monotonic or irregular frequency
-    grids, and suspected clipping / over-range (long runs of an identical
-    maximum value, which the R&S 3-column export shows when a reading is
-    pinned at the receiver ceiling).
+    grids, and suspected clipping / over-range. When the parsed R&S ``header``
+    is supplied, its authoritative ``OverRange Flag`` is honoured: an
+    over-ranged scan is a blocking issue (the receiver saturated, so recorded
+    levels may under-represent the true emission and the scan should be
+    excluded in favour of a valid repeat).
     """
     issues: list[str] = []
     flags: list[str] = []
+    header = header or {}
 
     if df is None or len(df) == 0:
         return ValidationResult(name, 0, float('nan'), float('nan'),
-                                float('nan'), False, ['Trace is empty.'])
+                                float('nan'), False, ['Trace is empty.'],
+                                header=header)
 
     f = df[FREQ_COL].to_numpy(dtype=float)
     y = df[LEVEL_COL].to_numpy(dtype=float)
     n = len(df)
+
+    # Authoritative receiver OverRange flag from the R&S header.
+    if header.get('overrange'):
+        issues.append('Receiver OverRange flag set (saturation/overload) — '
+                      'levels may be under-reported; exclude and use a valid '
+                      'repeat.')
 
     n_nan = int(np.isnan(f).sum() + np.isnan(y).sum())
     if n_nan:
@@ -137,7 +246,8 @@ def validate_trace(name: str, df: pd.DataFrame,
     if not grid_regular and not issues:
         flags.append('Irregular frequency grid — steps vary >5% from median.')
 
-    # Suspected clipping / over-range: a flat top at the global maximum.
+    # Suspected clipping / over-range from the data itself: a flat top at the
+    # global maximum. Advisory only — the header flag above is authoritative.
     if n:
         ymax = float(np.nanmax(y))
         at_max = np.isclose(y, ymax, atol=1e-6)
@@ -154,7 +264,7 @@ def validate_trace(name: str, df: pd.DataFrame,
         name=name, n_points=n,
         f_min=float(np.nanmin(f)), f_max=float(np.nanmax(f)),
         median_step_mhz=median_step, grid_regular=grid_regular,
-        issues=issues, flags=flags,
+        issues=issues, flags=flags, header=header,
     )
 
 
@@ -717,6 +827,7 @@ class ReportInputs:
     reviewed_by: str = ''
     approved_by: str = ''
     revision: str = 'A'
+    headers: dict[str, dict] = field(default_factory=dict)
 
 
 @dataclass
@@ -732,7 +843,8 @@ class AnalysisBundle:
 
 def run_analysis(inp: ReportInputs) -> AnalysisBundle:
     """Execute the full analysis workflow and return every artefact."""
-    validations = {n: validate_trace(n, df) for n, df in inp.traces.items()}
+    validations = {n: validate_trace(n, df, inp.headers.get(n))
+                   for n, df in inp.traces.items()}
     usable = {n: df for n, df in inp.traces.items() if validations[n].usable}
     if not usable:
         raise ValueError('No usable traces after validation.')
@@ -770,10 +882,15 @@ def build_report_html(inp: ReportInputs, bundle: AnalysisBundle) -> str:
         status = ('OK' if v.usable and not v.flags else
                   'FLAGGED' if v.usable else 'EXCLUDED')
         notes = '; '.join(v.issues + v.flags) or '—'
+        if 'overrange' in v.header:
+            over = 'YES' if v.header['overrange'] else 'No'
+        else:
+            over = '—'
         vrows.append(
             f'<tr><td>{esc(v.name)}</td><td>{v.n_points}</td>'
             f'<td>{v.f_min:.0f}–{v.f_max:.0f}</td>'
             f'<td>{v.median_step_mhz:.3f}</td>'
+            f'<td>{over}</td>'
             f'<td>{status}</td><td>{esc(notes)}</td></tr>')
     validation_rows = '\n'.join(vrows)
 
@@ -830,6 +947,60 @@ def build_report_html(inp: ReportInputs, bundle: AnalysisBundle) -> str:
 </table>"""
 
     config_li = '\n'.join(f'<li>{esc(n)}</li>' for n in inp.traces)
+
+    # --- instrument metadata harvested from R&S headers -------------------
+    def _uniq(field_name: str) -> list[str]:
+        seen = []
+        for h in inp.headers.values():
+            val = h.get(field_name)
+            if val and val not in seen:
+                seen.append(val)
+        return seen
+
+    def _fmt(field_name: str, label: str) -> str:
+        vals = _uniq(field_name)
+        if not vals:
+            return ''
+        return f'<li><strong>{label}:</strong> {esc(", ".join(vals))}</li>'
+
+    instrument_li = ''.join(filter(None, [
+        _fmt('detector', 'Detector'),
+        _fmt('if_filter', 'IF bandwidth'),
+        _fmt('dwell', 'Dwell time'),
+        _fmt('attenuation', 'Attenuation'),
+        _fmt('antenna', 'Antenna / transducer'),
+    ]))
+    instrument_html = (f'<ul>{instrument_li}</ul>' if instrument_li else
+                       '<p class="meta">Instrument metadata unavailable '
+                       '(no R&S header parsed).</p>')
+
+    # --- per-config measurement-conditions table -------------------------
+    cond_rows = []
+    have_conditions = any(
+        inp.headers.get(n, {}).get(k)
+        for n in inp.traces
+        for k in ('start_time', 'stop_time')) or any(
+        'overrange' in inp.headers.get(n, {}) for n in inp.traces)
+    for n in inp.traces:
+        h = inp.headers.get(n, {})
+        start = h.get('start_time', '—')
+        stop = h.get('stop_time', '—')
+        if 'overrange' in h:
+            over = 'YES' if h['overrange'] else 'No'
+        else:
+            over = '—'
+        cond_rows.append(
+            f'<tr><td>{esc(n)}</td><td>{esc(start)}</td>'
+            f'<td>{esc(stop)}</td><td>{over}</td></tr>')
+    conditions_html = ''
+    if have_conditions:
+        conditions_html = f"""
+<h3>3.1 Measurement conditions</h3>
+<table class="emc-table">
+ <tr><th>Configuration</th><th>Start time</th><th>Stop time</th>
+     <th>OverRange</th></tr>
+ {''.join(cond_rows)}
+</table>"""
 
     f = bundle.figures
     fig_overlay = _fig_html(f['overlay'], 'overlay', first=True)
@@ -914,6 +1085,9 @@ were identified by prominence (&ge; {inp.prominence_db:.0f} dB, &ge;
 {inp.min_sep_mhz:.0f} MHz separation). A point-by-point worst-case envelope
 was formed across all valid configurations and compared to the Class
 {inp.cls} limit.</p>
+<p>Instrument and antenna configuration (from the R&amp;S scan headers):</p>
+{instrument_html}
+{conditions_html}
 
 <h2 id="configs">4. Test configurations</h2>
 <ul>{config_li}</ul>
@@ -921,7 +1095,8 @@ was formed across all valid configurations and compared to the Class
 <h2 id="validation">5. Data validation</h2>
 <table class="emc-table">
  <tr><th>Configuration</th><th>Points</th><th>Range (MHz)</th>
-     <th>Median step (MHz)</th><th>Status</th><th>Notes</th></tr>
+     <th>Median step (MHz)</th><th>OverRange</th>
+     <th>Status</th><th>Notes</th></tr>
  {validation_rows}
 </table>
 

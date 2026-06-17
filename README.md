@@ -1,9 +1,14 @@
 # EMI Pre-Compliance Analysis — Cardiac Biplane
 
-Notebook-based analysis and presentation aid for radiated-emissions
-pre-compliance measurements taken on a Philips cardiac biplane system,
-30 MHz – 1 GHz, with the broadband antenna placed at multiple positions
-in the lab. Four operating modes are covered:
+Radiated-emissions pre-compliance analysis for a Philips cardiac biplane
+system, 30 MHz – 1 GHz, with a broadband antenna placed at multiple
+positions in the lab. The **primary interface is the Streamlit dashboard**
+([dashboard.py](dashboard.py)) — an interactive tool for comparing traces
+and generating full CISPR 11 compliance reports. A Jupyter notebook
+([emi_analysis.ipynb](emi_analysis.ipynb)) is retained for batch,
+mode-by-mode report generation.
+
+The following operating modes / sweeps are covered:
 
 * **Standby** (18 May 2026) — three antenna positions.
 * **Movement + X-ray** (19 May 2026) — two antenna positions (X-ray exposure
@@ -64,7 +69,10 @@ data/26May/                           New stand (26 May): Standby2 + Ambient2 +
 data/ambient/                         Site ambient (system off) — 13 May 2026
   ambient.txt                         used as the 'Ambient (no system)' trace
 
-emi_analysis.ipynb                    main Jupyter notebook
+dashboard.py                          Streamlit dashboard — the main interface
+emc_analysis.py                       EMC compliance analysis engine (validation,
+                                        stats, worst-case, margins, HTML report)
+emi_analysis.ipynb                    Jupyter notebook — batch per-mode reports
 run_all_modes.py                      executes the notebook once per mode and refreshes reports/
 reports/                              generated on each notebook run (mode-tagged)
   overlay_positions_<mode>.html       interactive Plotly: all positions for that mode
@@ -77,6 +85,10 @@ reports/                              generated on each notebook run (mode-tagge
   baseline_delta_<mode>.{html,csv}    Δ vs. the *Only cabinets* baseline (sections 10),
                                        written for every mode that includes that position
 ```
+
+> **Note:** `data/` and `reports/` are git-ignored — the raw measurement
+> record and generated artefacts are kept out of version control. They
+> still live on disk locally; only the code is tracked.
 
 The `_Att.txt` files alongside each scan record the RF attenuator setting
 the receiver chose for auto-ranging. They are **informational only** — the
@@ -93,31 +105,83 @@ Requires Python 3.10+.
 # 1. Install dependencies
 py -3 -m pip install -r requirements.txt
 
-# 2. Open and run the notebook in VS Code
-code emi_analysis.ipynb
-#    → Run All Cells
+# 2. Launch the dashboard (the main interface)
+py -3 -m streamlit run dashboard.py
 ```
 
-To re-execute the notebook headlessly and refresh everything in
-`reports/` for **both** modes:
+The dashboard opens in your browser at `http://localhost:8501`.
+
+---
+
+## The dashboard (main interface)
+
+`dashboard.py` is a Streamlit app with two tools, selectable from the
+sidebar:
+
+### 1. Trace comparison
+
+Pick one **reference** trace and any number of **comparison** traces (from
+the workspace `data/` folder or your own uploads). The app renders:
+
+* an **overlay** of every trace against the CISPR 11 limit line, and
+* **Δ-vs-reference** subplots highlighting where each comparison rises
+  above the reference, with the top-N Δ peaks tabulated.
+
+A standalone HTML report and the Δ data (CSV) are downloadable.
+
+### 2. EMC compliance analysis
+
+A full IEC 60601-1-2 / CISPR 11 style workflow over two or more selected
+configurations:
+
+* **Data validation** — empty/NaN checks, frequency-grid integrity, and
+  receiver saturation. The R&S **`OverRange` flag is read straight from
+  each scan header**: an over-ranged scan is automatically **excluded**
+  (its levels may under-report the true emission), and a suspected
+  flat-top clipping heuristic flags borderline cases.
+* **Per-configuration statistics** — peak level & frequency, mean, median,
+  95th percentile, peak count, peaks over limit, worst margin, and a
+  broadband-span indicator.
+* **Worst-case envelope** — point-by-point maximum across all valid
+  configurations, with per-point contributor attribution.
+* **Margin analysis** vs the CISPR 11 Group 1 (Class A/B, QP) limit —
+  worst/best margin, closest approach, and aggregate bandwidth over limit.
+* **Worst-case determination** — keyed off the smallest compliance margin
+  with a quantitative, regulatory-style justification.
+* **Spectral interpretation** — harmonic-family detection and
+  broadband-vs-narrowband reasoning.
+* **Plots** — overlay, worst-case envelope, margin plot, auto-zoom on the
+  critical band, and summary bar charts.
+
+The downloadable **HTML report** is fully structured (title page, revision
+history, executive summary, methodology, configurations, data validation,
+results, plots, margin analysis, peak tables, technical discussion,
+worst-case determination, risks & uncertainties, conclusion). The
+**Methodology** section and a **measurement-conditions** table are
+auto-populated from the R&S scan headers (detector, IF bandwidth, dwell,
+attenuation, antenna model, start/stop time, OverRange). Optional
+*Prepared / Reviewed / Approved by* fields populate a reviewer block.
+
+---
+
+## Notebook (batch report generation)
+
+For headless, mode-by-mode regeneration of everything in `reports/`:
 
 ```powershell
 py -3 run_all_modes.py
 ```
 
-This runs the notebook twice (once with `MODE = 'Standby'`, once with
-`MODE = 'Movement+Xray'`) and writes mode-tagged outputs into `reports/`.
-To refresh a single mode only, edit `MODE` in section 1 of the notebook
-and run it normally, or call `jupyter nbconvert --execute` directly.
+This rewrites the notebook's `MODE` knob and executes
+[emi_analysis.ipynb](emi_analysis.ipynb) once per `TEST_MODES` entry,
+writing mode-tagged HTML + CSV outputs into `reports/`. To refresh a
+single mode only, edit `MODE` in the notebook's config cell and run it
+normally, or call `jupyter nbconvert --execute` directly.
 
----
-
-## What the notebook produces
+The notebook itself contains:
 
 1. **Configuration cell** with one-stop knobs:
-   - `MODE` — `'Standby'` or `'Movement+Xray'`; selects which dataset
-     drives sections 2–8. The `TEST_MODES` dict above it maps each mode
-     to its data root and antenna positions.
+   - `MODE` — selects which `TEST_MODES` dataset drives sections 2–8.
    - `CISPR_CLASS` — `'A'` (industrial / professional healthcare) or `'B'`
      (residential).
    - `MEAS_DISTANCE` / `LIMIT_DISTANCE` — distance correction in dB,

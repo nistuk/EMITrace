@@ -466,6 +466,8 @@ def page_emc_analysis() -> None:
     try:
         traces = {name: load_trace(src, knobs['dist_corr_db'])
                   for name, src in sources.items()}
+        headers = {name: emc.parse_rs_header(src)
+                   for name, src in sources.items()}
     except Exception as exc:  # noqa: BLE001
         st.error(f'Failed to read a trace: {exc}')
         return
@@ -476,7 +478,7 @@ def page_emc_analysis() -> None:
         limit_distance=knobs['limit_distance'],
         prominence_db=knobs['prominence'], min_sep_mhz=knobs['min_sep'],
         prepared_by=prepared_by, reviewed_by=reviewed_by,
-        approved_by=approved_by, revision=revision)
+        approved_by=approved_by, revision=revision, headers=headers)
 
     try:
         bundle = emc.run_analysis(inp)
@@ -504,6 +506,8 @@ def page_emc_analysis() -> None:
             'Configuration': v.name, 'Points': v.n_points,
             'Range (MHz)': f'{v.f_min:.0f}–{v.f_max:.0f}',
             'Step (MHz)': round(v.median_step_mhz, 3),
+            'OverRange': ('YES' if v.header['overrange'] else 'No')
+                         if 'overrange' in v.header else '—',
             'Status': 'OK' if v.usable and not v.flags else
                       ('FLAGGED' if v.usable else 'EXCLUDED'),
             'Notes': '; '.join(v.issues + v.flags) or '—',
