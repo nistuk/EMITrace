@@ -411,6 +411,18 @@ def _select_configs() -> tuple[dict[str, object], dict]:
                                key='emc_prom')
         min_sep = st.slider('Min peak separation (MHz)', 0.5, 10.0, 2.0, 0.5,
                             key='emc_sep')
+        st.markdown('**Risk model**')
+        sigma_db = st.number_input(
+            'Measurement uncertainty σ (dB)', min_value=0.0, max_value=10.0,
+            value=float(emc.DEFAULT_SIGMA_DB), step=0.1, key='emc_sigma',
+            help='1σ standard uncertainty. Default 3.0 dB assumes a typical '
+                 'U≈6 dB (k=2) accredited radiated-emission budget — override '
+                 'with your lab\'s value.')
+        guard_db = st.number_input(
+            'Guard band (dB)', min_value=0.0, max_value=20.0,
+            value=float(emc.DEFAULT_GUARD_DB), step=0.5, key='emc_guard',
+            help='Margin below the limit counted as "near-limit" for the '
+                 'peak-in-guard and near-limit-bandwidth metrics.')
         source_mode = st.radio('Trace source',
                                ['Workspace `data/`', 'Upload'], key='emc_src')
 
@@ -437,7 +449,8 @@ def _select_configs() -> tuple[dict[str, object], dict]:
 
     return sources, dict(cispr_class=cispr_class, meas_distance=meas_distance,
                          limit_distance=limit_distance, dist_corr_db=dist_corr_db,
-                         prominence=prominence, min_sep=min_sep)
+                         prominence=prominence, min_sep=min_sep,
+                         sigma_db=sigma_db, guard_db=guard_db)
 
 
 def page_emc_analysis() -> None:
@@ -477,6 +490,7 @@ def page_emc_analysis() -> None:
         meas_distance=knobs['meas_distance'],
         limit_distance=knobs['limit_distance'],
         prominence_db=knobs['prominence'], min_sep_mhz=knobs['min_sep'],
+        sigma_db=knobs['sigma_db'], guard_db=knobs['guard_db'],
         prepared_by=prepared_by, reviewed_by=reviewed_by,
         approved_by=approved_by, revision=revision, headers=headers)
 
@@ -525,9 +539,20 @@ def page_emc_analysis() -> None:
             if len(s.peaks):
                 st.dataframe(s.peaks.head(12), use_container_width=True)
     with tabs[4]:
-        st.markdown(f'### {bundle.worst.name}')
-        st.write(bundle.worst.rationale)
-        st.write(emc.spectral_narrative(bundle.stats, bundle.worst))
+        w = bundle.worst
+        st.markdown(f'### {w.name}')
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric('Highest risk', w.by_risk)
+        c2.metric('Smallest margin', w.by_margin)
+        c3.metric('Highest peak', w.by_peak)
+        c4.metric('Highest mean', w.by_mean)
+        if w.by_risk != w.by_margin:
+            st.info(f'Risk ranking selects **{w.by_risk}** (most near-limit '
+                    f'peaks), while the single closest-to-limit point is in '
+                    f'**{w.by_margin}** — cite the latter as the formal '
+                    f'minimum-margin compliance figure.')
+        st.write(w.rationale)
+        st.write(emc.spectral_narrative(bundle.stats, w))
 
     report_html = emc.build_report_html(inp, bundle)
     env_csv = bundle.envelope.to_csv(index=False).encode('utf-8')

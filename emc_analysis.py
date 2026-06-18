@@ -35,6 +35,7 @@ import plotly.graph_objects as go
 import plotly.io as pio
 from plotly.subplots import make_subplots
 from scipy.signal import find_peaks
+from scipy.special import ndtr  # standard-normal CDF (vectorised)
 
 FREQ_COL = 'freq_mhz'
 LEVEL_COL = 'field_corr_dbuvm'
@@ -48,6 +49,13 @@ CISPR11_LIMITS = {
 
 PALETTE = ['#1f77b4', '#d62728', '#2ca02c', '#9467bd', '#ff7f0e',
            '#17becf', '#e377c2', '#8c564b', '#bcbd22', '#7f7f7f']
+
+# --- Measurement-uncertainty defaults --------------------------------------
+# Typical accredited radiated-emission expanded uncertainty is U ≈ 5–6 dB
+# (k = 2), i.e. a standard uncertainty σ ≈ 2.5–3 dB. We default to the more
+# conservative end; the caller can override with a lab-specific value.
+DEFAULT_SIGMA_DB = 3.0       # 1σ measurement uncertainty (U≈6 dB, k=2)
+DEFAULT_GUARD_DB = 6.0       # pre-compliance guard band for "near-limit" counts
 
 
 # --------------------------------------------------------------------------- #
@@ -311,6 +319,9 @@ class TraceStats:
     worst_margin_freq_mhz: float
     broadband_span_mhz: float
     broadband_center_mhz: float
+    exceedance_prob: float       # P(at least one true peak exceeds the limit)
+    n_within_guard: int          # peaks with margin < guard band
+    near_limit_bw_mhz: float     # full-trace bandwidth with margin < guard band
     peaks: pd.DataFrame
 
 
@@ -346,8 +357,32 @@ def broadband_indicator(df: pd.DataFrame, elevation_db: float = 10.0
     return float(best_span), best_center
 
 
+def exceedance_probability(margins_db: np.ndarray, sigma_db: float) -> float:
+    """Probability that at least one true level exceeds the limit.
+
+    Each peak's true level is modelled as measured ± N(0, σ²). The per-peak
+    exceedance probability is Φ(−margin/σ); assuming independence, the
+    configuration-level probability of *any* real exceedance is
+    ``1 − Π(1 − Pᵢ)``.
+
+    With a single peak this reduces to a monotonic function of that peak's
+    margin, so it is a strict generalisation of ranking by margin. Errors are
+    only partly independent in practice (shared setup), so treat the absolute
+    value as a conservative *ranking* score rather than a calibrated PoF.
+    """
+    margins_db = np.asarray(margins_db, dtype=float)
+    margins_db = margins_db[~np.isnan(margins_db)]
+    if margins_db.size == 0 or sigma_db <= 0:
+        # degenerate: fall back to a hard threshold on the worst margin
+        return 1.0 if (margins_db.size and np.nanmin(margins_db) < 0) else 0.0
+    p_i = ndtr(-margins_db / sigma_db)        # Φ(−m/σ) per peak
+    return float(1.0 - np.prod(1.0 - p_i))
+
+
 def trace_statistics(name: str, df: pd.DataFrame, cls: str,
-                     prominence_db: float, min_sep_mhz: float) -> TraceStats:
+                     prominence_db: float, min_sep_mhz: float,
+                     sigma_db: float = DEFAULT_SIGMA_DB,
+                     guard_db: float = DEFAULT_GUARD_DB) -> TraceStats:
     y = df[LEVEL_COL].to_numpy(dtype=float)
     f = df[FREQ_COL].to_numpy(dtype=float)
     peaks = detect_peaks(df, cls, prominence_db, min_sep_mhz)
@@ -367,6 +402,19 @@ def trace_statistics(name: str, df: pd.DataFrame, cls: str,
     n_exceed = int((peaks['margin_db'] < 0).sum()) if len(peaks) else 0
     span, center = broadband_indicator(df)
 
+    # --- risk metrics ----------------------------------------------------
+    peak_margins = (peaks['margin_db'].to_numpy() if len(peaks)
+                    else np.array([worst_margin]))
+    p_fail = exceedance_probability(peak_margins, sigma_db)
+    n_within_guard = int((peak_margins < guard_db).sum()) if len(peaks) else 0
+    # near-limit bandwidth from the full trace (catches broadband shoulders)
+    near = valid & (margin < guard_db)
+    if near.any() and valid.sum() > 1:
+        step = float(np.median(np.diff(f)))
+        near_bw = float(near.sum() * step)
+    else:
+        near_bw = 0.0
+
     return TraceStats(
         name=name,
         peak_dbuvm=float(y[imax]),
@@ -380,6 +428,9 @@ def trace_statistics(name: str, df: pd.DataFrame, cls: str,
         worst_margin_freq_mhz=worst_margin_f,
         broadband_span_mhz=span,
         broadband_center_mhz=center,
+        exceedance_prob=p_fail,
+        n_within_guard=n_within_guard,
+        near_limit_bw_mhz=near_bw,
         peaks=peaks,
     )
 
@@ -397,6 +448,9 @@ def stats_table(stats: dict[str, TraceStats]) -> pd.DataFrame:
             'Peaks > thr': s.n_peaks,
             'Peaks > limit': s.n_exceed,
             'Worst margin (dB)': s.worst_margin_db,
+            'P(fail) %': 100.0 * s.exceedance_prob,
+            'Peaks in guard': s.n_within_guard,
+            'Near-limit BW (MHz)': s.near_limit_bw_mhz,
             'Broadband span (MHz)': s.broadband_span_mhz,
         })
     return pd.DataFrame(rows)
@@ -484,6 +538,7 @@ class WorstCase:
     by_peak: str
     by_mean: str
     by_margin: str
+    by_risk: str
     peak_dbuvm: float
     runner_up: Optional[str]
     peak_delta_db: float
@@ -491,41 +546,72 @@ class WorstCase:
 
 
 def determine_worst_case(stats: dict[str, TraceStats]) -> WorstCase:
-    """Pick the worst-case configuration and justify it quantitatively."""
+    """Pick the worst-case configuration and justify it quantitatively.
+
+    Selection is **two-tier**:
+
+    * **Tier 1 — risk (governs):** the configuration with the highest
+      aggregate exceedance probability ``P(fail)``. This integrates *every*
+      near-limit peak through the measurement-uncertainty model, so a trace
+      with many slightly-marginal peaks is correctly ranked above one with a
+      single close peak. Ties (within 1 percentage point) fall back to the
+      smallest compliance margin.
+    * **Tier 2 — compliance (reported alongside):** the smallest single-point
+      margin, which is the formal CISPR 11 pass/fail quantity to cite in the
+      technical file.
+    """
     by_peak = max(stats.values(), key=lambda s: s.peak_dbuvm)
     by_mean = max(stats.values(), key=lambda s: s.mean_dbuvm)
     # smallest (most negative) margin = closest to / over the limit
     by_margin = min(
         (s for s in stats.values() if not np.isnan(s.worst_margin_db)),
         key=lambda s: s.worst_margin_db, default=by_peak)
+    # highest aggregate exceedance probability = highest real-test risk
+    by_risk = max(stats.values(),
+                  key=lambda s: (s.exceedance_prob, -s.worst_margin_db))
 
-    # Overall worst-case keys off the smallest compliance margin, which is the
-    # quantity that actually governs pass/fail.
-    worst = by_margin
+    # Tier-1 governs, but if the top risk scores are effectively tied
+    # (≤ 1 pp apart) defer to the strict minimum-margin compliance figure.
+    if abs(by_risk.exceedance_prob - by_margin.exceedance_prob) <= 0.01:
+        worst = by_margin
+    else:
+        worst = by_risk
+
     others = sorted((s for s in stats.values() if s.name != worst.name),
-                    key=lambda s: s.peak_dbuvm, reverse=True)
+                    key=lambda s: s.exceedance_prob, reverse=True)
     runner_up = others[0] if others else None
     peak_delta = (worst.peak_dbuvm - runner_up.peak_dbuvm) if runner_up else 0.0
 
     parts = [
         f'Configuration “{worst.name}” represents the worst-case EMC '
-        f'radiated-emission condition. Its strongest emission reaches '
-        f'{worst.peak_dbuvm:.1f} dBµV/m at {worst.peak_freq_mhz:.1f} MHz, '
-        f'leaving a worst-case CISPR 11 margin of '
+        f'radiated-emission condition. It carries the highest aggregate '
+        f'exceedance probability ({100*worst.exceedance_prob:.0f}% under the '
+        f'measurement-uncertainty model), with {worst.n_within_guard} peak(s) '
+        f'inside the guard band and ~{worst.near_limit_bw_mhz:.0f} MHz of '
+        f'near-limit bandwidth. Its strongest emission reaches '
+        f'{worst.peak_dbuvm:.1f} dBµV/m at {worst.peak_freq_mhz:.1f} MHz, and '
+        f'its smallest single-point CISPR 11 margin is '
         f'{worst.worst_margin_db:+.1f} dB at '
         f'{worst.worst_margin_freq_mhz:.1f} MHz.'
     ]
     if runner_up is not None:
         parts.append(
-            f'This is {peak_delta:+.1f} dB relative to the next-highest '
-            f'configuration “{runner_up.name}” '
-            f'({runner_up.peak_dbuvm:.1f} dBµV/m at '
-            f'{runner_up.peak_freq_mhz:.1f} MHz).')
-    if by_peak.name != worst.name:
+            f'The next-highest-risk configuration is “{runner_up.name}” '
+            f'({100*runner_up.exceedance_prob:.0f}% P(fail), worst margin '
+            f'{runner_up.worst_margin_db:+.1f} dB).')
+    if by_margin.name != worst.name:
         parts.append(
-            f'Note the absolute peak occurs in “{by_peak.name}” '
+            f'Note the single closest-to-limit point belongs to '
+            f'“{by_margin.name}” ({by_margin.worst_margin_db:+.1f} dB); '
+            f'however “{worst.name}” governs the risk ranking because its '
+            f'multiple near-limit emissions make a real exceedance more '
+            f'likely. Cite “{by_margin.name}” as the formal minimum-margin '
+            f'compliance figure.')
+    elif by_peak.name != worst.name:
+        parts.append(
+            f'The absolute peak occurs in “{by_peak.name}” '
             f'({by_peak.peak_dbuvm:.1f} dBµV/m); however “{worst.name}” '
-            f'governs because its emission sits closest to the limit line.')
+            f'governs because its emissions sit closest to the limit line.')
     if worst.broadband_span_mhz > 20:
         parts.append(
             f'It also shows the broadest elevated band '
@@ -535,7 +621,8 @@ def determine_worst_case(stats: dict[str, TraceStats]) -> WorstCase:
 
     return WorstCase(
         name=worst.name, by_peak=by_peak.name, by_mean=by_mean.name,
-        by_margin=by_margin.name, peak_dbuvm=worst.peak_dbuvm,
+        by_margin=by_margin.name, by_risk=by_risk.name,
+        peak_dbuvm=worst.peak_dbuvm,
         runner_up=runner_up.name if runner_up else None,
         peak_delta_db=peak_delta, rationale=' '.join(parts),
     )
@@ -823,6 +910,8 @@ class ReportInputs:
     limit_distance: float
     prominence_db: float = 6.0
     min_sep_mhz: float = 2.0
+    sigma_db: float = DEFAULT_SIGMA_DB
+    guard_db: float = DEFAULT_GUARD_DB
     prepared_by: str = ''
     reviewed_by: str = ''
     approved_by: str = ''
@@ -850,7 +939,7 @@ def run_analysis(inp: ReportInputs) -> AnalysisBundle:
         raise ValueError('No usable traces after validation.')
 
     stats = {n: trace_statistics(n, df, inp.cls, inp.prominence_db,
-                                 inp.min_sep_mhz)
+                                 inp.min_sep_mhz, inp.sigma_db, inp.guard_db)
              for n, df in usable.items()}
     envelope = worst_case_envelope(usable)
     margin = margin_analysis(envelope, inp.cls)
@@ -1088,6 +1177,16 @@ was formed across all valid configurations and compared to the Class
 <p>Instrument and antenna configuration (from the R&amp;S scan headers):</p>
 {instrument_html}
 {conditions_html}
+<p><strong>Worst-case selection.</strong> Selection is two-tier. The
+governing metric is the <em>aggregate exceedance probability</em> P(fail) —
+each detected peak's true level is modelled as measured&nbsp;±&nbsp;N(0,&nbsp;σ²)
+with σ&nbsp;=&nbsp;{inp.sigma_db:.1f}&nbsp;dB (lab measurement uncertainty),
+and P(fail)&nbsp;=&nbsp;1&nbsp;−&nbsp;Π(1&nbsp;−&nbsp;Φ(−marginᵢ/σ)). This
+integrates every near-limit peak, so a configuration with many slightly
+marginal peaks ranks above one with a single close peak. The strict
+single-point <em>minimum margin</em> is retained and reported as the formal
+CISPR&nbsp;11 pass/fail figure. "Near-limit" counts use a guard band of
+{inp.guard_db:.1f}&nbsp;dB.</p>
 
 <h2 id="configs">4. Test configurations</h2>
 <ul>{config_li}</ul>
@@ -1133,9 +1232,9 @@ was formed across all valid configurations and compared to the Class
 
 <h2 id="worstcase">11. Worst-case determination</h2>
 <p>{esc(w.rationale)}</p>
-<p class="meta">Cross-check — highest absolute peak: “{esc(w.by_peak)}”;
-highest mean spectrum: “{esc(w.by_mean)}”; smallest compliance margin:
-“{esc(w.by_margin)}”.</p>
+<p class="meta">Cross-check — highest exceedance risk: “{esc(w.by_risk)}”;
+smallest compliance margin: “{esc(w.by_margin)}”; highest absolute peak:
+“{esc(w.by_peak)}”; highest mean spectrum: “{esc(w.by_mean)}”.</p>
 
 <h2 id="risks">12. Risks &amp; uncertainties</h2>
 <ul>
