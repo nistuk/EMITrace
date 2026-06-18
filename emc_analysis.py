@@ -725,19 +725,50 @@ _XAXIS = dict(title='Frequency (MHz)', type='log',
 
 
 def plot_overlay(traces: dict[str, pd.DataFrame], cls: str,
-                 limit_distance: float) -> go.Figure:
+                 limit_distance: float,
+                 stats: Optional[dict[str, 'TraceStats']] = None,
+                 guard_db: float = DEFAULT_GUARD_DB,
+                 n_markers: int = 6) -> go.Figure:
     fig = go.Figure()
     lf, lv = limit_line(cls)
     fig.add_trace(go.Scatter(
         x=lf, y=lv, mode='lines',
         name=f'CISPR 11 Class {cls} @ {limit_distance:.0f} m (QP)',
         line=dict(color='black', dash='dash', width=2)))
+    colour_for = {}
     for i, (name, df) in enumerate(traces.items()):
+        colour_for[name] = PALETTE[i % len(PALETTE)]
         fig.add_trace(go.Scatter(
             x=df[FREQ_COL], y=df[LEVEL_COL], mode='lines', name=name,
-            line=dict(color=PALETTE[i % len(PALETTE)], width=1.3),
+            line=dict(color=colour_for[name], width=1.3),
             hovertemplate='%{x:.2f} MHz<br>%{y:.2f} dBµV/m<extra>'
                           + name + '</extra>'))
+
+    # --- worst-N peak markers per trace (only peaks inside guard band) ----
+    if stats:
+        for name, s in stats.items():
+            if name not in traces or not len(s.peaks):
+                continue
+            # peaks within the guard band, worst (smallest margin) first
+            sub = (s.peaks[s.peaks['margin_db'] < guard_db]
+                   .sort_values('margin_db').head(n_markers))
+            if not len(sub):
+                continue
+            fig.add_trace(go.Scatter(
+                x=sub['freq_mhz'], y=sub['level_dbuvm'],
+                mode='markers+text',
+                marker=dict(symbol='triangle-up', size=11,
+                            color=colour_for[name],
+                            line=dict(color='black', width=1)),
+                text=[f'{f:.0f} MHz<br>{m:+.1f} dB'
+                      for f, m in zip(sub['freq_mhz'], sub['margin_db'])],
+                textposition='top center', textfont=dict(size=9),
+                name=f'{name} — worst {len(sub)} peaks',
+                customdata=np.c_[[name] * len(sub), sub['margin_db']],
+                hovertemplate='%{customdata[0]}<br>%{x:.2f} MHz<br>'
+                              '%{y:.2f} dBµV/m<br>margin %{customdata[1]:+.2f} '
+                              'dB<extra></extra>'))
+
     fig.update_xaxes(**_XAXIS)
     fig.update_yaxes(title='Field strength (dBµV/m, QP)',
                      showgrid=True, gridcolor='lightgrey')
@@ -807,7 +838,10 @@ def plot_margin(envelope: pd.DataFrame, cls: str) -> go.Figure:
 
 
 def plot_zoom(traces: dict[str, pd.DataFrame], center_mhz: float,
-              cls: str, half_decade: float = 0.35) -> go.Figure:
+              cls: str, half_decade: float = 0.35,
+              stats: Optional[dict[str, 'TraceStats']] = None,
+              guard_db: float = DEFAULT_GUARD_DB,
+              n_markers: int = 6) -> go.Figure:
     """Linear-axis zoom centred on the dominant emission band."""
     lo = max(30.0, center_mhz / (10 ** half_decade))
     hi = min(1000.0, center_mhz * (10 ** half_decade))
@@ -816,11 +850,40 @@ def plot_zoom(traces: dict[str, pd.DataFrame], center_mhz: float,
     fig.add_trace(go.Scatter(x=lf, y=lv, mode='lines',
                              name=f'CISPR 11 Class {cls}',
                              line=dict(color='black', dash='dash', width=2)))
+    colour_for = {}
     for i, (name, df) in enumerate(traces.items()):
+        colour_for[name] = PALETTE[i % len(PALETTE)]
         m = (df[FREQ_COL] >= lo) & (df[FREQ_COL] <= hi)
         fig.add_trace(go.Scatter(
             x=df[FREQ_COL][m], y=df[LEVEL_COL][m], mode='lines', name=name,
-            line=dict(color=PALETTE[i % len(PALETTE)], width=1.5)))
+            line=dict(color=colour_for[name], width=1.5)))
+
+    # --- worst-N peak markers per trace, restricted to the visible band ---
+    if stats:
+        for name, s in stats.items():
+            if name not in traces or not len(s.peaks):
+                continue
+            sub = s.peaks[(s.peaks['margin_db'] < guard_db)
+                          & (s.peaks['freq_mhz'] >= lo)
+                          & (s.peaks['freq_mhz'] <= hi)]
+            sub = sub.sort_values('margin_db').head(n_markers)
+            if not len(sub):
+                continue
+            fig.add_trace(go.Scatter(
+                x=sub['freq_mhz'], y=sub['level_dbuvm'],
+                mode='markers+text',
+                marker=dict(symbol='triangle-up', size=11,
+                            color=colour_for[name],
+                            line=dict(color='black', width=1)),
+                text=[f'{f:.0f} MHz<br>{mg:+.1f} dB'
+                      for f, mg in zip(sub['freq_mhz'], sub['margin_db'])],
+                textposition='top center', textfont=dict(size=9),
+                name=f'{name} — worst {len(sub)} peaks',
+                customdata=np.c_[[name] * len(sub), sub['margin_db']],
+                hovertemplate='%{customdata[0]}<br>%{x:.2f} MHz<br>'
+                              '%{y:.2f} dBµV/m<br>margin %{customdata[1]:+.2f} '
+                              'dB<extra></extra>'))
+
     fig.update_xaxes(title='Frequency (MHz)', range=[lo, hi],
                      showgrid=True, gridcolor='lightgrey')
     fig.update_yaxes(title='Field strength (dBµV/m, QP)',
@@ -831,6 +894,86 @@ def plot_zoom(traces: dict[str, pd.DataFrame], center_mhz: float,
         template='plotly_white', height=460,
         legend=dict(orientation='h', y=-0.22, x=0),
         margin=dict(l=70, r=30, t=70, b=90))
+    return fig
+
+
+def plot_pfail_visual(stats_one: 'TraceStats', sigma_db: float,
+                      guard_db: float = DEFAULT_GUARD_DB,
+                      n_peaks: int = 4) -> Optional[go.Figure]:
+    """Visualise how each peak's exceedance probability arises.
+
+    For the worst few peaks of one configuration, each measured level is drawn
+    as a Gaussian "smear" of width σ (the measurement uncertainty). The limit
+    is a vertical line; the shaded tail of the bell curve that lies *above the
+    limit* is exactly p_i = Φ(−margin/σ) — the probability that the peak's true
+    level exceeds the limit. This makes the otherwise abstract P(fail) number
+    concrete.
+    """
+    peaks = stats_one.peaks
+    if peaks is None or not len(peaks):
+        return None
+    sel = peaks.sort_values('margin_db').head(n_peaks)
+    n = len(sel)
+    cols = min(n, 2)
+    rows = int(np.ceil(n / cols))
+
+    titles = [f'{r.freq_mhz:.0f} MHz · margin {r.margin_db:+.1f} dB'
+              for r in sel.itertuples()]
+    fig = make_subplots(rows=rows, cols=cols, subplot_titles=titles,
+                        horizontal_spacing=0.12,
+                        vertical_spacing=0.22 if rows > 1 else 0.0)
+
+    for k, r in enumerate(sel.itertuples()):
+        row = k // cols + 1
+        col = k % cols + 1
+        level = float(r.level_dbuvm)
+        limit = float(r.limit_dbuvm)
+        margin = float(r.margin_db)
+        # Gaussian PDF centred on the measured level
+        x = np.linspace(level - 4 * sigma_db, level + 4 * sigma_db, 400)
+        pdf = np.exp(-0.5 * ((x - level) / sigma_db) ** 2) / (
+            sigma_db * np.sqrt(2 * np.pi))
+        p_i = float(ndtr(-margin / sigma_db)) if sigma_db > 0 else (
+            1.0 if margin < 0 else 0.0)
+
+        # full distribution (light)
+        fig.add_trace(go.Scatter(
+            x=x, y=pdf, mode='lines', line=dict(color='#1f77b4', width=1.5),
+            showlegend=False, hoverinfo='skip'), row=row, col=col)
+        # shaded exceedance tail (x >= limit) — area == p_i
+        tail = x >= limit
+        if tail.any():
+            fig.add_trace(go.Scatter(
+                x=np.concatenate([[limit], x[tail]]),
+                y=np.concatenate([[0.0], pdf[tail]]),
+                mode='lines', fill='tozeroy',
+                line=dict(color='#d62728', width=0),
+                fillcolor='rgba(214,39,40,0.45)', showlegend=False,
+                hoverinfo='skip'), row=row, col=col)
+        # measured level (centre) and limit lines
+        ymax = float(pdf.max())
+        fig.add_trace(go.Scatter(
+            x=[level, level], y=[0, ymax], mode='lines',
+            line=dict(color='#1f77b4', dash='dot', width=1.2),
+            showlegend=False, hoverinfo='skip'), row=row, col=col)
+        fig.add_trace(go.Scatter(
+            x=[limit, limit], y=[0, ymax * 1.05], mode='lines',
+            line=dict(color='black', dash='dash', width=1.6),
+            showlegend=False, hoverinfo='skip'), row=row, col=col)
+        # annotate p_i over the shaded tail
+        fig.add_annotation(
+            x=limit + 0.4 * sigma_db, y=ymax * 0.6,
+            text=f'p = {p_i:.3f}', showarrow=False,
+            font=dict(color='#d62728', size=11), xanchor='left',
+            row=row, col=col)
+        fig.update_xaxes(title='Field strength (dBµV/m)', row=row, col=col)
+        fig.update_yaxes(showticklabels=False, row=row, col=col)
+
+    fig.update_layout(
+        title=f'P(fail) visualised — “{stats_one.name}”, σ = {sigma_db:.1f} dB '
+              f'(red tail over the limit = p per peak)',
+        template='plotly_white', height=260 * rows + 80,
+        margin=dict(l=40, r=30, t=90, b=60))
     return fig
 
 
@@ -947,12 +1090,18 @@ def run_analysis(inp: ReportInputs) -> AnalysisBundle:
 
     center = stats[worst.name].peak_freq_mhz
     figures = {
-        'overlay': plot_overlay(usable, inp.cls, inp.limit_distance),
+        'overlay': plot_overlay(usable, inp.cls, inp.limit_distance,
+                                stats=stats, guard_db=inp.guard_db),
         'envelope': plot_envelope(envelope, inp.cls, inp.limit_distance),
         'margin': plot_margin(envelope, inp.cls),
-        'zoom': plot_zoom(usable, center, inp.cls),
+        'zoom': plot_zoom(usable, center, inp.cls,
+                          stats=stats, guard_db=inp.guard_db),
         'bars': plot_summary_bars(stats),
     }
+    pfail_fig = plot_pfail_visual(stats[worst.name], inp.sigma_db,
+                                  inp.guard_db)
+    if pfail_fig is not None:
+        figures['pfail'] = pfail_fig
     return AnalysisBundle(
         validations=validations, stats=stats, envelope=envelope,
         margin=margin, worst=worst, figures=figures,
@@ -1003,6 +1152,61 @@ def build_report_html(inp: ReportInputs, bundle: AnalysisBundle) -> str:
     spectral = spectral_narrative(bundle.stats, bundle.worst)
     exec_sum = executive_summary(bundle.stats, bundle.worst,
                                  bundle.margin, inp.cls)
+
+    # --- transparent P(fail) calculation for the governing configuration ---
+    ws = bundle.stats[bundle.worst.name]
+    sigma = inp.sigma_db
+    wpeaks = ws.peaks.sort_values('margin_db')
+    calc_rows = []
+    running = 1.0  # running product of (1 - p_i)
+    for _, pk in wpeaks.iterrows():
+        mi = float(pk['margin_db'])
+        pi = float(ndtr(-mi / sigma)) if sigma > 0 else (1.0 if mi < 0 else 0.0)
+        running *= (1.0 - pi)
+        in_guard = mi < inp.guard_db
+        calc_rows.append(
+            f'<tr style="{"" if in_guard else "color:#999;"}">'
+            f'<td>{pk["freq_mhz"]:.2f}</td>'
+            f'<td>{pk["level_dbuvm"]:.2f}</td>'
+            f'<td>{pk["limit_dbuvm"]:.1f}</td>'
+            f'<td>{mi:+.2f}</td>'
+            f'<td>{pi:.4f}</td>'
+            f'<td>{1.0 - pi:.4f}</td>'
+            f'<td>{1.0 - running:.4f}</td></tr>')
+    p_fail_final = 1.0 - running
+    calc_table_html = (
+        '<table class="emc-table">\n'
+        ' <tr><th>Freq (MHz)</th><th>Level (dBµV/m)</th><th>Limit (dBµV/m)</th>'
+        '<th>Margin m<sub>i</sub> (dB)</th><th>Φ(−m<sub>i</sub>/σ) = p<sub>i</sub></th>'
+        '<th>1 − p<sub>i</sub></th><th>Cumulative P(fail)</th></tr>\n'
+        + '\n'.join(calc_rows) + '\n</table>')
+
+    if not len(wpeaks):
+        calc_block_html = (
+            f'<p>No peaks were detected above the '
+            f'{inp.prominence_db:.0f}&nbsp;dB prominence threshold for '
+            f'“{esc(bundle.worst.name)}”, so its exceedance probability is '
+            f'taken as 0%.</p>')
+    else:
+        calc_block_html = f"""
+<p>The governing configuration “{esc(bundle.worst.name)}” has its
+exceedance probability built up peak-by-peak below, using
+σ&nbsp;=&nbsp;{sigma:.1f}&nbsp;dB. For each peak the margin is
+m<sub>i</sub>&nbsp;=&nbsp;limit&nbsp;−&nbsp;level; the per-peak exceedance
+probability is p<sub>i</sub>&nbsp;=&nbsp;Φ(−m<sub>i</sub>/σ) (standard-normal
+CDF); and the cumulative configuration probability after including each peak
+is 1&nbsp;−&nbsp;∏(1&nbsp;−&nbsp;p<sub>i</sub>). Peaks outside the
+{inp.guard_db:.0f}&nbsp;dB guard band (greyed) contribute negligibly but are
+included for completeness.</p>
+{calc_table_html}
+<p>Worked example for the closest peak: margin
+m&nbsp;=&nbsp;{float(wpeaks.iloc[0]['margin_db']):+.2f}&nbsp;dB →
+p&nbsp;=&nbsp;Φ({-float(wpeaks.iloc[0]['margin_db']):+.2f}/{sigma:.1f})
+&nbsp;=&nbsp;Φ({-float(wpeaks.iloc[0]['margin_db'])/sigma:+.2f})
+&nbsp;=&nbsp;{float(ndtr(-float(wpeaks.iloc[0]['margin_db'])/sigma)):.4f}.
+Combining all {len(wpeaks)} peak(s) gives an aggregate
+<strong>P(fail)&nbsp;=&nbsp;{100*p_fail_final:.1f}%</strong>
+(summary-table value {100*ws.exceedance_prob:.1f}%).</p>"""
 
     # --- risks / uncertainties ---
     risks = []
@@ -1097,6 +1301,8 @@ def build_report_html(inp: ReportInputs, bundle: AnalysisBundle) -> str:
     fig_margin = _fig_html(f['margin'], 'margin', first=False)
     fig_zoom = _fig_html(f['zoom'], 'zoom', first=False)
     fig_bars = _fig_html(f['bars'], 'bars', first=False)
+    fig_pfail = (_fig_html(f['pfail'], 'pfail', first=False)
+                 if 'pfail' in f else '')
 
     m = bundle.margin
     w = bundle.worst
@@ -1177,16 +1383,80 @@ was formed across all valid configurations and compared to the Class
 <p>Instrument and antenna configuration (from the R&amp;S scan headers):</p>
 {instrument_html}
 {conditions_html}
-<p><strong>Worst-case selection.</strong> Selection is two-tier. The
-governing metric is the <em>aggregate exceedance probability</em> P(fail) —
-each detected peak's true level is modelled as measured&nbsp;±&nbsp;N(0,&nbsp;σ²)
-with σ&nbsp;=&nbsp;{inp.sigma_db:.1f}&nbsp;dB (lab measurement uncertainty),
-and P(fail)&nbsp;=&nbsp;1&nbsp;−&nbsp;Π(1&nbsp;−&nbsp;Φ(−marginᵢ/σ)). This
-integrates every near-limit peak, so a configuration with many slightly
-marginal peaks ranks above one with a single close peak. The strict
-single-point <em>minimum margin</em> is retained and reported as the formal
-CISPR&nbsp;11 pass/fail figure. "Near-limit" counts use a guard band of
-{inp.guard_db:.1f}&nbsp;dB.</p>
+
+<h3>3.2 Worst-case selection methodology</h3>
+<p>Identifying a single &ldquo;worst-case&rdquo; configuration is not as
+simple as choosing the highest peak. Two distinct questions are at play:
+(a) <em>which configuration is formally closest to the CISPR&nbsp;11
+limit?</em> and (b) <em>which configuration is most likely to fail a real,
+accredited measurement?</em> A configuration with one peak very close to the
+limit answers (a); a configuration with many peaks slightly further from the
+limit may nonetheless answer (b), because each near-limit peak is an
+independent opportunity to exceed once measurement uncertainty and
+unit-to-unit variation are taken into account. This tool therefore applies a
+deliberately <strong>two-tier</strong> selection so that neither question is
+hidden.</p>
+
+<p><strong>Tier&nbsp;1 — exceedance risk (governs the ranking).</strong>
+The governing metric is the <em>aggregate exceedance probability</em>,
+P(fail). Each detected peak <em>i</em> has a compliance margin
+m<sub>i</sub>&nbsp;=&nbsp;limit&nbsp;−&nbsp;level. Its true level is modelled
+as the measured level plus a Gaussian measurement error,
+N(0,&nbsp;σ²), with σ&nbsp;=&nbsp;{inp.sigma_db:.1f}&nbsp;dB for this report
+(the 1σ standard measurement uncertainty — see below). The probability that
+peak <em>i</em>&rsquo;s <em>true</em> level is above the limit is therefore
+Φ(−m<sub>i</sub>/σ), where Φ is the standard-normal CDF. Treating the peaks
+as independent, the probability that <em>at least one</em> peak in the
+configuration genuinely exceeds the limit is:</p>
+<p style="text-align:center; font-size:1.05em;">
+P(fail) = 1 − ∏<sub>i</sub> [ 1 − Φ(−m<sub>i</sub>/σ) ]
+</p>
+<p>This integrates the contribution of <em>every</em> near-limit peak into a
+single objective score. A configuration with twenty peaks at +3&nbsp;dB
+margin will score a higher P(fail) than one with a single peak at +2&nbsp;dB,
+correctly capturing the engineering intuition that many marginal emissions
+are collectively riskier than one slightly closer emission. Crucially, when a
+configuration has only one significant peak, P(fail) reduces to a monotonic
+function of that peak&rsquo;s margin — so this metric is a strict
+<em>generalisation</em> of ranking by margin, not a departure from it.</p>
+
+<p><strong>Tier&nbsp;2 — minimum compliance margin (reported alongside).</strong>
+The strict single-point minimum margin, min<sub>f</sub>(limit&nbsp;−&nbsp;level),
+is retained and reported for every configuration. This is the formal
+CISPR&nbsp;11 pass/fail quantity and is the figure that should be cited in the
+Technical Construction File and any declaration of conformity. Where the
+risk-based and margin-based winners differ, the report names both explicitly
+so the distinction is auditable.</p>
+
+<p><strong>Tie-breaking.</strong> If the two highest-risk configurations are
+within 1 percentage point of P(fail) of one another, the selection defers to
+the smaller minimum margin (Tier&nbsp;2), ensuring the formal compliance
+figure breaks any practical tie.</p>
+
+<p><strong>Supporting indicators.</strong> Two further metrics make the
+ranking transparent rather than a black box: the number of peaks falling
+within the guard band ({inp.guard_db:.1f}&nbsp;dB below the limit), and the
+total near-limit bandwidth (the aggregate span of the spectrum whose margin
+is below the guard band). The latter captures broadband shoulders that
+discrete peak-picking alone can miss.</p>
+
+<p><strong>Measurement-uncertainty value (σ).</strong> σ&nbsp;=&nbsp;
+{inp.sigma_db:.1f}&nbsp;dB is used here. A typical accredited radiated-emission
+setup has an expanded uncertainty U&nbsp;≈&nbsp;5–6&nbsp;dB at a 95%
+confidence level (coverage factor k&nbsp;=&nbsp;2), i.e. a standard
+uncertainty σ&nbsp;≈&nbsp;2.5–3&nbsp;dB. The value should be replaced with the
+test laboratory&rsquo;s own CISPR&nbsp;16-4-2 uncertainty budget when
+available; it is exposed as a parameter for exactly this reason.</p>
+
+<p><strong>Assumptions and limitations.</strong> The independence assumption
+in the P(fail) product is conservative — in reality peak errors share common
+contributions (the same antenna, cable and site), so they are partially
+correlated and the absolute P(fail) value slightly overstates the true joint
+probability. It is therefore intended as a robust <em>ranking</em> score
+rather than a calibrated probability of failure. The Gaussian error model
+also does not capture systematic effects (antenna-factor error, site
+imperfections, near-field behaviour at the measurement distance), which are
+discussed separately under Risks &amp; Uncertainties.</p>
 
 <h2 id="configs">4. Test configurations</h2>
 <ul>{config_li}</ul>
@@ -1235,6 +1505,20 @@ CISPR&nbsp;11 pass/fail figure. "Near-limit" counts use a guard band of
 <p class="meta">Cross-check — highest exceedance risk: “{esc(w.by_risk)}”;
 smallest compliance margin: “{esc(w.by_margin)}”; highest absolute peak:
 “{esc(w.by_peak)}”; highest mean spectrum: “{esc(w.by_mean)}”.</p>
+
+<h3>11.1 How the exceedance probability is calculated</h3>
+<p>Each measured peak is treated not as a single exact value but as a
+distribution: the true level could lie anywhere within the measurement
+uncertainty. The figure below draws each peak's level as a Gaussian bell
+curve of width σ&nbsp;=&nbsp;{inp.sigma_db:.1f}&nbsp;dB centred on the measured
+value. The black dashed line is the CISPR&nbsp;11 limit; the <span
+style="color:#d62728;"><strong>red shaded tail</strong></span> is the part of
+the distribution that sits <em>above</em> the limit. The area of that tail is
+exactly the per-peak exceedance probability
+p&nbsp;=&nbsp;Φ(−margin/σ). The closer a peak is to (or over) the limit, the
+larger the red area.</p>
+{('<div>' + fig_pfail + '</div>') if fig_pfail else ''}
+{calc_block_html}
 
 <h2 id="risks">12. Risks &amp; uncertainties</h2>
 <ul>

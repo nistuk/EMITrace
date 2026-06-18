@@ -553,6 +553,13 @@ def page_emc_analysis() -> None:
                     f'minimum-margin compliance figure.')
         st.write(w.rationale)
         st.write(emc.spectral_narrative(bundle.stats, w))
+        if 'pfail' in bundle.figures:
+            st.markdown('#### How P(fail) is built up')
+            st.caption('Each peak\'s level is spread by the measurement '
+                       'uncertainty σ; the red tail above the limit is its '
+                       'exceedance probability p = Φ(−margin/σ).')
+            st.plotly_chart(bundle.figures['pfail'],
+                            use_container_width=True)
 
     report_html = emc.build_report_html(inp, bundle)
     env_csv = bundle.envelope.to_csv(index=False).encode('utf-8')
